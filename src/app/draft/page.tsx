@@ -1,0 +1,269 @@
+// MLBB Draft Counter — Next.js / React single-file page
+// ------------------------------------------------------
+// CSV auto-load only (no manual upload). Suggestions update live as picks are typed.
+
+'use client'
+
+import React, { useEffect, useMemo, useState } from 'react'
+import { Users2, Swords, Shield, RefreshCcw, Link as LinkIcon, Sparkles, Trash2 } from 'lucide-react'
+
+let supabase: any = null
+try {
+  const { createClient } = require('@supabase/supabase-js')
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL
+  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  if (url && key) {
+    supabase = createClient(url, key)
+  }
+} catch {}
+
+type MatchupScore = { my_hero: string; enemy_hero: string; score: number }
+type Assignment = Record<string, { hero: string; score: number } | null>
+
+function parseCSV(text: string): MatchupScore[] {
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean)
+  if (!lines.length) return []
+  const header = lines[0].split(',').map(h => h.trim().toLowerCase())
+  const iMy = header.indexOf('my_hero')
+  const iEn = header.indexOf('enemy_hero')
+  const iSc = header.indexOf('score')
+  if (iMy < 0 || iEn < 0 || iSc < 0) return []
+  const rows: MatchupScore[] = []
+  for (let i = 1; i < lines.length; i++) {
+    const parts = lines[i].split(',')
+    if (parts.length < 3) continue
+    const myh = parts[iMy]?.trim()
+    const enh = parts[iEn]?.trim()
+    const sc = Number(parts[iSc])
+    if (!myh || !enh || Number.isNaN(sc)) continue
+    rows.push({ my_hero: myh, enemy_hero: enh, score: sc })
+  }
+  return rows
+}
+
+function greedySuggest(rows: MatchupScore[], enemies: string[], k = 5) {
+  const remaining = new Set(enemies.map(e => e.trim()).filter(Boolean))
+  const usedHeroes = new Set<string>()
+  const candidates: { score: number; my: string; en: string }[] = []
+  for (const r of rows) {
+    if (remaining.has(r.enemy_hero)) candidates.push({ score: r.score, my: r.my_hero, en: r.enemy_hero })
+  }
+  candidates.sort((a, b) => b.score - a.score)
+  const chosen: string[] = []
+  const assignment: Assignment = Object.fromEntries([...remaining].map(e => [e, null]))
+  let total = 0
+  while (remaining.size && chosen.length < k && candidates.length) {
+    const c = candidates.shift()!
+    if (c && remaining.has(c.en) && !usedHeroes.has(c.my)) {
+      remaining.delete(c.en)
+      usedHeroes.add(c.my)
+      chosen.push(c.my)
+      assignment[c.en] = { hero: c.my, score: c.score }
+      total += c.score
+      for (let i = candidates.length - 1; i >= 0; i--) {
+        if (candidates[i].my === c.my || candidates[i].en === c.en) candidates.splice(i, 1)
+      }
+    }
+  }
+  return { chosen: [...new Set(chosen)], assignment, total }
+}
+
+const DEFAULT_ROOM = 'public'
+
+type DraftState = {
+  room: string
+  k: number
+  teamA: string[]
+  teamB: string[]
+  bansA: string[]
+  bansB: string[]
+}
+
+const emptyState: DraftState = {
+  room: DEFAULT_ROOM,
+  k: 5,
+  teamA: Array(5).fill(''),
+  teamB: Array(5).fill(''),
+  bansA: Array(5).fill(''),
+  bansB: Array(5).fill(''),
+}
+
+function useRealtime(room: string, state: DraftState, setState: (fn: (s: DraftState)=>DraftState) => void) {
+  useEffect(() => {
+    if (!supabase) return
+    const channel = supabase.channel(`draft:${room}`)
+    channel.on('broadcast', { event: 'state' }, (payload: any) => {
+      if (payload?.payload?.state) setState(() => payload.payload.state as DraftState)
+    })
+    channel.subscribe()
+    return () => { supabase?.removeChannel?.(channel) }
+  }, [room, setState])
+
+  const broadcast = async (st: DraftState) => {
+    if (!supabase) return
+    await supabase.channel(`draft:${room}`).send({ type: 'broadcast', event: 'state', payload: { state: st } })
+  }
+  return broadcast
+}
+
+export default function DraftPage() {
+  const [rows, setRows] = useState<MatchupScore[]>([])
+  const [state, setState] = useState<DraftState>(emptyState)
+  const [roomInput, setRoomInput] = useState<string>(DEFAULT_ROOM)
+
+  const broadcast = useRealtime(state.room, state, setState)
+
+  const suggestions = useMemo(() => {
+    const enemyTeam = state.teamB.filter(Boolean)
+    return greedySuggest(rows, enemyTeam, state.k)
+  }, [rows, state.teamA, state.teamB, state.k])
+
+    async function loadDefaultCounters() {
+        // 1) Try live first
+        try {
+            const live = await fetch("/api/live-counters", { cache: "no-store" });
+            if (live.ok) {
+            const data = await live.json();
+            if (data?.ok && Array.isArray(data.rows) && data.rows.length) {
+                setRows(data.rows);
+                return;
+            }
+            }
+    } catch {}
+
+  // 2) Fallback to static CSV
+  try {
+    const res = await fetch("/counters.csv", { cache: "no-store" });
+    if (res.ok) {
+      const text = await res.text();
+      const parsed = parseCSV(text);
+      if (parsed.length) setRows(parsed);
+    }
+  } catch {}
+}
+
+useEffect(() => {
+    const id = setInterval(() => {
+        loadDefaultCounters();
+    }, 10 * 60 * 1000); // every 10 minutes
+    return () => clearInterval(id);
+}, []);
+
+  function applyRoom() {
+    setState(s => ({ ...s, room: roomInput || DEFAULT_ROOM }))
+  }
+
+  function pushState(st: DraftState) {
+    setState(st)
+    broadcast?.(st)
+  }
+
+  function updatePick(team: 'A'|'B', idx: number, val: string) {
+    const arr = team === 'A' ? [...state.teamA] : [...state.teamB]
+    arr[idx] = val
+    const st = { ...state, teamA: team==='A'?arr:state.teamA, teamB: team==='B'?arr:state.teamB }
+    pushState(st)
+  }
+
+  function updateBan(team: 'A'|'B', idx: number, val: string) {
+    const arr = team === 'A' ? [...state.bansA] : [...state.bansB]
+    arr[idx] = val
+    const st = { ...state, bansA: team==='A'?arr:state.bansA, bansB: team==='B'?arr:state.bansB }
+    pushState(st)
+  }
+
+  function clearAll() {
+    pushState({ ...emptyState, room: state.room })
+  }
+
+  function copyShareLink() {
+    const url = new URL(window.location.href)
+    url.searchParams.set('room', state.room)
+    navigator.clipboard.writeText(url.toString())
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100">
+      <div className="max-w-7xl mx-auto px-4 py-6">
+        <header className="flex items-center gap-3 mb-6">
+          <Swords className="w-7 h-7" />
+          <h1 className="text-2xl font-semibold">MLBB Draft Counter</h1>
+          <span className="ml-auto text-xs text-slate-400">Counters auto-loaded from /public/counters.csv</span>
+        </header>
+
+        <div className="grid md:grid-cols-2 gap-6 mb-6">
+          <div className="p-4 rounded-2xl bg-slate-900 border border-slate-800">
+            <div className="font-medium mb-2 flex items-center gap-2"><Users2 className="w-4 h-4"/>Room</div>
+            <div className="flex gap-2">
+              <input value={roomInput} onChange={e=>setRoomInput(e.target.value)} placeholder="public" className="flex-1 bg-slate-800 rounded-xl px-3 py-2 text-sm outline-none"/>
+              <button onClick={applyRoom} className="px-3 py-2 bg-slate-800 rounded-xl text-sm border border-slate-700">Join</button>
+              <button onClick={copyShareLink} className="px-3 py-2 bg-slate-800 rounded-xl text-sm border border-slate-700 flex items-center gap-1"><LinkIcon className="w-4 h-4"/>Share</button>
+            </div>
+          </div>
+
+          <div className="p-4 rounded-2xl bg-slate-900 border border-slate-800">
+            <div className="font-medium mb-2 flex items-center gap-2"><Shield className="w-4 h-4"/>Settings</div>
+            <label className="text-sm">Max picks (K)</label>
+            <input type="number" value={state.k} min={1} max={5} onChange={e=>pushState({ ...state, k: Math.max(1, Math.min(5, Number(e.target.value)||5)) })} className="w-24 bg-slate-800 rounded-xl px-3 py-2 text-sm outline-none ml-2"/>
+            <button onClick={clearAll} className="ml-3 inline-flex items-center gap-1 px-3 py-2 bg-slate-800 border border-slate-700 rounded-xl text-sm"><Trash2 className="w-4 h-4"/>Clear</button>
+          </div>
+        </div>
+
+        <div className="grid md:grid-cols-2 gap-6">
+          <TeamBoard title="Team A (You)" picks={state.teamA} bans={state.bansA} onPick={(idx, val) => updatePick('A', idx, val)} onBan={(idx, val) => updateBan('A', idx, val)} color="from-emerald-400/20 to-emerald-400/0" />
+          <TeamBoard title="Team B (Enemy)" picks={state.teamB} bans={state.bansB} onPick={(idx, val) => updatePick('B', idx, val)} onBan={(idx, val) => updateBan('B', idx, val)} color="from-rose-400/20 to-rose-400/0" />
+        </div>
+
+        <div className="mt-6 p-5 rounded-2xl bg-slate-900 border border-slate-800">
+          <div className="flex items-center gap-2 mb-3"><Sparkles className="w-4 h-4"/><h2 className="text-lg font-semibold">Suggested Picks vs Team B</h2></div>
+          {!rows.length ? (
+            <p className="text-sm text-slate-400">Provide /public/counters.csv to enable suggestions.</p>
+          ) : (
+            <div>
+              <p className="text-sm text-slate-300">Total counter score: <span className="font-semibold">{suggestions.total.toFixed(2)}</span></p>
+              <div className="mt-2">
+                <div className="text-sm"><span className="text-slate-400">Best picks (≤ {state.k}):</span> {suggestions.chosen.length ? suggestions.chosen.join(', ') : '(none)'}</div>
+                <ul className="mt-2 text-sm grid md:grid-cols-2 gap-2">
+                  {Object.keys(suggestions.assignment).map(e => {
+                    const a = suggestions.assignment[e]
+                    return (
+                      <li key={e} className="bg-slate-800/60 border border-slate-700 rounded-xl px-3 py-2">
+                        <span className="text-slate-400">vs</span> <span className="font-medium">{e}</span>: {a ? (<><span className="font-semibold">{a.hero}</span> <span className="text-slate-400">(score +{a.score.toFixed(2)})</span></>) : (<em className="text-slate-400">no strong counter found</em>)}
+                      </li>
+                    )
+                  })}
+                </ul>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="mt-8 text-xs text-slate-500 flex items-center gap-2">
+          <RefreshCcw className="w-3 h-3"/> Data updates live when both sides are in the same room (if Supabase is configured).
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function TeamBoard({ title, picks, bans, onPick, onBan, color }: { title: string; picks: string[]; bans: string[]; onPick: (idx: number, v: string) => void; onBan: (idx: number, v: string) => void; color: string }) {
+  return (
+    <div className={`relative p-5 rounded-2xl bg-slate-900 border border-slate-800 overflow-hidden`}>
+      <div className={`absolute inset-0 bg-gradient-to-b ${color} pointer-events-none`} />
+      <div className="relative">
+        <h3 className="text-lg font-semibold mb-3 flex items-center gap-2"><Swords className="w-4 h-4"/>{title}</h3>
+        <div className="grid grid-cols-5 gap-2">
+          {picks.map((v, i) => (
+            <input key={i} value={v} onChange={e=>onPick(i, e.target.value)} placeholder={`Pick ${i+1}`} className="bg-slate-800 rounded-xl px-3 py-2 text-sm outline-none border border-slate-700" />
+          ))}
+        </div>
+        <div className="mt-3 text-sm text-slate-400">Bans (optional)</div>
+        <div className="grid grid-cols-5 gap-2 mt-1">
+          {bans.map((v, i) => (
+            <input key={i} value={v} onChange={e=>onBan(i, e.target.value)} placeholder={`Ban ${i+1}`} className="bg-slate-800 rounded-xl px-3 py-2 text-sm outline-none border border-slate-700" />
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
