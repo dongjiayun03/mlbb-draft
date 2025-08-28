@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://mlbb-draft-wtps.vercel.app/draft/sitemap.xml
