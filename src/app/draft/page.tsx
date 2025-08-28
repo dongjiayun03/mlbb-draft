@@ -2,6 +2,9 @@
 // ------------------------------------------------------
 // CSV auto-load only (no manual upload). Suggestions update live as picks are typed.
 
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-4218624684932144"
+     crossorigin="anonymous"></script>
+
 'use client'
 
 import React, { useEffect, useMemo, useState } from 'react'
