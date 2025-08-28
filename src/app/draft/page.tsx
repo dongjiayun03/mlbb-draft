@@ -27,28 +27,28 @@ type Assignment = Record<string, { hero: string; score: number } | null>
 type LanesMap = Map<string, string>; // lower(hero) -> lane
 
 function parseCSV(text: string): MatchupScore[] {
-  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean)
-  if (!lines.length) return []
+  // handle BOM + CRLF + stray blanks
+  if (text && text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  if (!lines.length) return [];
+  const header = lines[0].replace(/^\uFEFF/, "").split(",").map(h => h.trim().toLowerCase());
+  const iMy = header.indexOf("my_hero");
+  const iEn = header.indexOf("enemy_hero");
+  const iSc = header.indexOf("score");
+  if (iMy < 0 || iEn < 0 || iSc < 0) return [];
 
-  const header = lines[0].split(',').map(h => h.trim().toLowerCase())
-  const iMy = header.indexOf('my_hero')
-  const iEn = header.indexOf('enemy_hero')
-  const iSc = header.indexOf('score')
-  if (iMy < 0 || iEn < 0 || iSc < 0) return []
-
-  const rows: MatchupScore[] = []
+  const out: MatchupScore[] = [];
   for (let i = 1; i < lines.length; i++) {
-    const parts = lines[i].split(',')
-    if (parts.length < 3) continue
-    const myh = parts[iMy]?.trim()
-    const enh = parts[iEn]?.trim()
-    const sc = Number(parts[iSc])
-    if (!myh || !enh || Number.isNaN(sc)) continue
-    rows.push({ my_hero: myh, enemy_hero: enh, score: sc })
+    const parts = lines[i].split(",");
+    if (parts.length < 3) continue;
+    const myh = (parts[iMy] ?? "").trim();
+    const enh = (parts[iEn] ?? "").trim();
+    const sc  = Number((parts[iSc] ?? "").trim());
+    if (!myh || !enh || Number.isNaN(sc)) continue;
+    out.push({ my_hero: myh, enemy_hero: enh, score: sc });
   }
-  return rows
+  return out;
 }
-
 function normalizeLane(s: string): string {
   const x = s.trim().toLowerCase();
   if (!x) return "";
@@ -62,12 +62,8 @@ function normalizeLane(s: string): string {
 
 
 // lane-aware greedy suggestions (kept for the existing suggestions panel)
-function greedySuggest(
-  rows: MatchupScore[],
-  enemies: string[],
-  k = 5,
-  lanes?: Map<string, string>
-) {
+function greedySuggest(rows: MatchupScore[], enemies: string[], k = 5) {
+  // map enemy names: lower -> original as typed
   const enemyMap = new Map<string, string>();
   for (const e of enemies) {
     const t = e.trim();
@@ -76,16 +72,13 @@ function greedySuggest(
 
   const remaining = new Set(enemyMap.keys());
   const usedHeroes = new Set<string>();
-  const usedLanes = new Set<string>();
+  const candidates: { score: number; my: string; enLower: string; enOrig: string }[] = [];
 
-  const candidates: { score: number; my: string; enLower: string; enOrig: string; lane: string }[] = [];
   for (const r of rows) {
     const enLower = r.enemy_hero.toLowerCase();
-    if (!remaining.has(enLower)) continue;
-    const laneRaw = lanes?.get(r.my_hero.toLowerCase()) || "";
-    const lane = normalizeLane(laneRaw);
-    if (!lane || !["Gold", "EXP", "Mid", "Jungle", "Roam"].includes(lane)) continue;
-    candidates.push({ score: r.score, my: r.my_hero, enLower, enOrig: enemyMap.get(enLower)!, lane });
+    if (remaining.has(enLower)) {
+      candidates.push({ score: r.score, my: r.my_hero, enLower, enOrig: enemyMap.get(enLower)! });
+    }
   }
 
   candidates.sort((a, b) => b.score - a.score);
@@ -96,24 +89,19 @@ function greedySuggest(
 
   while (remaining.size && chosen.length < k && candidates.length) {
     const c = candidates.shift()!;
-    if (
-      c &&
-      remaining.has(c.enLower) &&
-      !usedHeroes.has(c.my) &&
-      !usedLanes.has(c.lane)
-    ) {
+    if (c && remaining.has(c.enLower) && !usedHeroes.has(c.my)) {
       remaining.delete(c.enLower);
       usedHeroes.add(c.my);
-      usedLanes.add(c.lane);
       chosen.push(c.my);
       assignment[c.enOrig] = { hero: c.my, score: c.score };
       total += c.score;
+
       for (let i = candidates.length - 1; i >= 0; i--) {
-        const x = candidates[i];
-        if (x.my === c.my || x.enLower === c.enLower || x.lane === c.lane) candidates.splice(i, 1);
+        if (candidates[i].my === c.my || candidates[i].enLower === c.enLower) candidates.splice(i, 1);
       }
     }
   }
+
   return { chosen: [...new Set(chosen)], assignment, total };
 }
 
@@ -275,15 +263,22 @@ export default function DraftPage() {
       setLanes(m);
     } catch {}
   }
-
   async function loadDefaultCounters() {
     try {
-      const res = await fetch('/counters.csv', { cache: 'no-store' })
-      if (!res.ok) return
-      const text = await res.text()
-      const parsed = parseCSV(text)
-      if (parsed.length) setRows(parsed)
-    } catch {}
+      const res = await fetch("/counters.csv", { cache: "no-store" });
+      if (!res.ok) {
+        console.warn("counters.csv not found. HTTP", res.status);
+        setRows([]);
+        return;
+      }
+      let text = await res.text();
+      const parsed = parseCSV(text);
+      if (!parsed.length) console.warn("counters.csv parsed but 0 rows. Check header: my_hero,enemy_hero,score");
+      setRows(parsed);
+    } catch (e) {
+      console.warn("Failed to load counters.csv:", e);
+      setRows([]);
+    }
   }
 
   useEffect(() => {
@@ -368,6 +363,7 @@ export default function DraftPage() {
           <div className="p-4 rounded-2xl bg-slate-900 border border-slate-800">
             <div className="font-medium mb-2 flex items-center gap-2">
               <Shield className="w-4 h-4" />Settings
+              <span className="ml-3 text-xs text-slate-500">rows: {rows.length}</span>
             </div>
             <label className="text-sm">Max picks (K)</label>
             <input
