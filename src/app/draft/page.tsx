@@ -61,10 +61,14 @@ function normalizeLane(s: string): string {
 }
 
 
-// lane-aware greedy suggestions (kept for the existing suggestions panel)
-function greedySuggest(rows: MatchupScore[], enemies: string[], k = 5) {
-  // map enemy names: lower -> original as typed
-  const enemyMap = new Map<string, string>();
+function greedySuggest(
+  rows: MatchupScore[],
+  enemies: string[],
+  k = 5,
+  lanes?: Map<string, string>
+) {
+  // enemy names: case-insensitive map
+  const enemyMap = new Map<string, string>(); // lower -> original
   for (const e of enemies) {
     const t = e.trim();
     if (t) enemyMap.set(t.toLowerCase(), t);
@@ -72,13 +76,19 @@ function greedySuggest(rows: MatchupScore[], enemies: string[], k = 5) {
 
   const remaining = new Set(enemyMap.keys());
   const usedHeroes = new Set<string>();
-  const candidates: { score: number; my: string; enLower: string; enOrig: string }[] = [];
+  const usedLanes  = new Set<string>();
 
+  // build candidates with lane info; skip heroes with unknown lanes
+  const candidates: { score: number; my: string; enLower: string; enOrig: string; lane: string }[] = [];
   for (const r of rows) {
     const enLower = r.enemy_hero.toLowerCase();
-    if (remaining.has(enLower)) {
-      candidates.push({ score: r.score, my: r.my_hero, enLower, enOrig: enemyMap.get(enLower)! });
-    }
+    if (!remaining.has(enLower)) continue;
+
+    const laneRaw = lanes?.get(r.my_hero.toLowerCase()) || "";
+    const lane = normalizeLane(laneRaw);
+    if (!["Gold","EXP","Mid","Jungle","Roam"].includes(lane)) continue;
+
+    candidates.push({ score: r.score, my: r.my_hero, enLower, enOrig: enemyMap.get(enLower)!, lane });
   }
 
   candidates.sort((a, b) => b.score - a.score);
@@ -89,15 +99,26 @@ function greedySuggest(rows: MatchupScore[], enemies: string[], k = 5) {
 
   while (remaining.size && chosen.length < k && candidates.length) {
     const c = candidates.shift()!;
-    if (c && remaining.has(c.enLower) && !usedHeroes.has(c.my)) {
+    if (
+      c &&
+      remaining.has(c.enLower) &&
+      !usedHeroes.has(c.my) &&
+      !usedLanes.has(c.lane)        // ← enforce 1 per lane
+    ) {
       remaining.delete(c.enLower);
       usedHeroes.add(c.my);
+      usedLanes.add(c.lane);
+
       chosen.push(c.my);
       assignment[c.enOrig] = { hero: c.my, score: c.score };
       total += c.score;
 
+      // prune conflicts (same hero, same enemy, same lane)
       for (let i = candidates.length - 1; i >= 0; i--) {
-        if (candidates[i].my === c.my || candidates[i].enLower === c.enLower) candidates.splice(i, 1);
+        const x = candidates[i];
+        if (x.my === c.my || x.enLower === c.enLower || x.lane === c.lane) {
+          candidates.splice(i, 1);
+        }
       }
     }
   }
@@ -105,7 +126,7 @@ function greedySuggest(rows: MatchupScore[], enemies: string[], k = 5) {
   return { chosen: [...new Set(chosen)], assignment, total };
 }
 
-// --- NEW: utilities to estimate win chance for fixed teams ---
+
 
 function buildScoreMap(rows: MatchupScore[]) {
   const map = new Map<string, number>();
@@ -239,30 +260,31 @@ export default function DraftPage() {
 
 
   async function loadLanesCsv() {
-    try {
-      const res = await fetch("/lanes.csv", { cache: "no-store" });
-      if (!res.ok) return; // silently ignore if not present
-      const text = await res.text();
-      // simple CSV parse: hero,lane (no commas inside names)
-      const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-      if (!lines.length) return;
-      const header = lines[0].toLowerCase();
-      const iHero = header.split(",").indexOf("hero");
-      const iLane = header.split(",").indexOf("lane");
-      if (iHero < 0 || iLane < 0) return;
+  try {
+    const res = await fetch("/lanes.csv", { cache: "no-store" });
+    if (!res.ok) return; // silently ignore if not present
+    const text = await res.text();
+    const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    if (!lines.length) return;
 
-      const m = new Map<string,string>();
-      for (let i = 1; i < lines.length; i++) {
-        const parts = lines[i].split(",");
-        if (parts.length < 2) continue;
-        const h = (parts[iHero] ?? "").trim();
-        const ln = (parts[iLane] ?? "").trim();
-        if (!h || !ln) continue;
-        m.set(h.toLowerCase(), normalizeLane(ln));
-      }
-      setLanes(m);
-    } catch {}
-  }
+    const header = lines[0].toLowerCase();
+    const iHero = header.split(",").indexOf("hero");
+    const iLane = header.split(",").indexOf("lane");
+    if (iHero < 0 || iLane < 0) return;
+
+    const m = new Map<string, string>();
+    for (let i = 1; i < lines.length; i++) {
+      const parts = lines[i].split(",");
+      if (parts.length < 2) continue;
+      const h  = (parts[iHero] ?? "").trim();
+      const ln = (parts[iLane] ?? "").trim();
+      if (!h || !ln) continue;
+      m.set(h.toLowerCase(), normalizeLane(ln));
+    }
+    setLanes(m);
+  } catch {}
+}
+
   async function loadDefaultCounters() {
     try {
       const res = await fetch("/counters.csv", { cache: "no-store" });
@@ -283,6 +305,7 @@ export default function DraftPage() {
 
   useEffect(() => {
     loadDefaultCounters();
+    loadLanesCsv();
     const url = new URL(window.location.href);
     const r = url.searchParams.get('room');
     if (r && r !== state.room) setState(s => ({ ...s, room: r }));
