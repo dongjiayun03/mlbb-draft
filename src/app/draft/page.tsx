@@ -56,13 +56,13 @@ function normalizeLane(s: string): string {
 }
 
 
+// lane-aware greedy suggestions (kept for the existing suggestions panel)
 function greedySuggest(
   rows: MatchupScore[],
   enemies: string[],
   k = 5,
   lanes?: Map<string, string>
 ) {
-  // enemies map (lower -> original)
   const enemyMap = new Map<string, string>();
   for (const e of enemies) {
     const t = e.trim();
@@ -73,27 +73,16 @@ function greedySuggest(
   const usedHeroes = new Set<string>();
   const usedLanes = new Set<string>();
 
-  // Build candidates with lane attached; skip if lane missing or not recognized
   const candidates: { score: number; my: string; enLower: string; enOrig: string; lane: string }[] = [];
   for (const r of rows) {
     const enLower = r.enemy_hero.toLowerCase();
     if (!remaining.has(enLower)) continue;
     const laneRaw = lanes?.get(r.my_hero.toLowerCase()) || "";
     const lane = normalizeLane(laneRaw);
-    if (!lane || !["Gold", "EXP", "Mid", "Jungle", "Roam"].includes(lane)) {
-      // skip heroes without a valid lane — ensures the one-per-lane rule actually binds
-      continue;
-    }
-    candidates.push({
-      score: r.score,
-      my: r.my_hero,
-      enLower,
-      enOrig: enemyMap.get(enLower)!,
-      lane
-    });
+    if (!lane || !["Gold", "EXP", "Mid", "Jungle", "Roam"].includes(lane)) continue;
+    candidates.push({ score: r.score, my: r.my_hero, enLower, enOrig: enemyMap.get(enLower)!, lane });
   }
 
-  // Sort by best score first
   candidates.sort((a, b) => b.score - a.score);
 
   const chosen: string[] = [];
@@ -102,9 +91,8 @@ function greedySuggest(
 
   while (remaining.size && chosen.length < k && candidates.length) {
     const c = candidates.shift()!;
-    if (!c) break;
-
     if (
+      c &&
       remaining.has(c.enLower) &&
       !usedHeroes.has(c.my) &&
       !usedLanes.has(c.lane)
@@ -112,22 +100,86 @@ function greedySuggest(
       remaining.delete(c.enLower);
       usedHeroes.add(c.my);
       usedLanes.add(c.lane);
-
       chosen.push(c.my);
       assignment[c.enOrig] = { hero: c.my, score: c.score };
       total += c.score;
-
-      // prune conflicts by hero, enemy, or lane
       for (let i = candidates.length - 1; i >= 0; i--) {
         const x = candidates[i];
-        if (x.my === c.my || x.enLower === c.enLower || x.lane === c.lane) {
-          candidates.splice(i, 1);
-        }
+        if (x.my === c.my || x.enLower === c.enLower || x.lane === c.lane) candidates.splice(i, 1);
+      }
+    }
+  }
+  return { chosen: [...new Set(chosen)], assignment, total };
+}
+
+// --- NEW: utilities to estimate win chance for fixed teams ---
+
+function buildScoreMap(rows: MatchupScore[]) {
+  const map = new Map<string, number>();
+  for (const r of rows) {
+    map.set(`${r.my_hero.toLowerCase()}@@${r.enemy_hero.toLowerCase()}`, r.score);
+  }
+  return map;
+}
+
+function pairScore(scoreMap: Map<string, number>, my: string, en: string) {
+  return scoreMap.get(`${my.toLowerCase()}@@${en.toLowerCase()}`) ?? 0;
+}
+
+function logistic(x: number, k = 0.35, x0 = 6) {
+  // k = slope, x0 = midpoint (tune these if you want more/less sensitivity)
+  return 1 / (1 + Math.exp(-k * (x - x0)));
+}
+
+function computeWinAgainst(rows: MatchupScore[], teamA: string[], teamB: string[]) {
+  const A = teamA.map(h => h.trim()).filter(Boolean);
+  const B = teamB.map(h => h.trim()).filter(Boolean);
+  if (A.length === 0 || B.length === 0) return null;
+
+  const scoreMap = buildScoreMap(rows);
+
+  // Exact best pairing by brute force (≤ 5! = 120) — small and fast.
+  const allies = [...A];
+  const enemies = [...B];
+
+  function* permute(arr: number[]): any {
+    const a = arr.slice();
+    const c = Array(a.length).fill(0);
+    yield a.slice();
+    let i = 0;
+    while (i < a.length) {
+      if (c[i] < i) {
+        if (i % 2 === 0) [a[0], a[i]] = [a[i], a[0]];
+        else [a[c[i]], a[i]] = [a[i], a[c[i]]];
+        c[i]++;
+        i = 0;
+        yield a.slice();
+      } else {
+        c[i] = 0; i++;
       }
     }
   }
 
-  return { chosen: [...new Set(chosen)], assignment, total };
+  const len = Math.min(allies.length, enemies.length, 5);
+  const idx = [...Array(len).keys()];
+  let bestTotal = -Infinity;
+  let bestPairs: { my: string; enemy: string; score: number }[] = [];
+
+  for (const p of permute(idx)) {
+    let total = 0;
+    const pairs: { my: string; enemy: string; score: number }[] = [];
+    for (let i = 0; i < len; i++) {
+      const my = allies[i];
+      const en = enemies[p[i]];
+      const sc = pairScore(scoreMap, my, en);
+      total += sc;
+      pairs.push({ my, enemy: en, score: sc });
+    }
+    if (total > bestTotal) { bestTotal = total; bestPairs = pairs; }
+  }
+
+  const winProb = logistic(bestTotal); // 0..1
+  return { total: bestTotal, winProb, pairs: bestPairs };
 }
 
 
@@ -184,6 +236,11 @@ export default function DraftPage() {
     const enemyTeam = state.teamB.filter(Boolean);
     return greedySuggest(rows, enemyTeam, state.k, lanes);
   }, [rows, state.teamA, state.teamB, state.k, lanes]);
+
+  const winEst = useMemo(() => {
+    return computeWinAgainst(rows, state.teamA, state.teamB);
+  }, [rows, state.teamA, state.teamB]);
+
 
   async function loadLanesCsv() {
     try {
@@ -380,6 +437,35 @@ export default function DraftPage() {
             </div>
           )}
         </div>
+
+        {/* New: Win rate estimation for the exact teams */}
+        <div className="mt-6 p-5 rounded-2xl bg-slate-900 border border-slate-800">
+          <div className="flex items-center gap-2 mb-3">
+            <Sparkles className="w-4 h-4" />
+            <h2 className="text-lg font-semibold">Win chance (Team A vs Team B)</h2>
+          </div>
+          {!rows.length ? (
+            <p className="text-sm text-slate-400">Counters data not loaded.</p>
+          ) : !winEst ? (
+            <p className="text-sm text-slate-400">Enter picks for both teams to estimate.</p>
+          ) : (
+            <div>
+              <div className="text-2xl font-bold">
+                {(winEst.winProb * 100).toFixed(1)}% <span className="text-sm font-normal text-slate-400">(estimated)</span>
+              </div>
+              <div className="mt-3 text-sm text-slate-300">Best matchup assignment:</div>
+              <ul className="mt-2 text-sm grid md:grid-cols-2 gap-2">
+                {winEst.pairs.map((p, i) => (
+                  <li key={i} className="bg-slate-800/60 border border-slate-700 rounded-xl px-3 py-2">
+                    <span className="font-semibold">{p.my}</span> <span className="text-slate-400">vs</span> <span className="font-medium">{p.enemy}</span> <span className="text-slate-400">(score +{p.score.toFixed(2)})</span>
+                  </li>
+                ))}
+              </ul>
+              <div className="mt-2 text-sm text-slate-400">Total score: {winEst.total.toFixed(2)} • Model: logistic(total, k=0.35, mid=6)</div>
+            </div>
+          )}
+        </div>
+
 
         <div className="mt-8 text-xs text-slate-500 flex items-center gap-2">
           <RefreshCcw className="w-3 h-3" />Data updates live when both sides are in the same room (if Supabase is configured).
