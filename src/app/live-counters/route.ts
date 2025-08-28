@@ -32,7 +32,7 @@ export async function GET() {
     //   (2) Fallback to a naive text scrape for "COUNTER HERO" lines if present.
 
     // Try #1: look for JSON arrays of heroes; adjust these patterns as needed if they change
-    let pairs: { my_hero: string; enemy_hero: string; score: number }[] = [];
+    const pairs: { my_hero: string; enemy_hero: string; score: number }[] = [];
 
     // Quick-and-safe fallback #2:
     // Find repeated blocks like: "COUNTER HERO ... 1st <HeroA> 2nd <HeroB> 3rd <HeroC> ..."

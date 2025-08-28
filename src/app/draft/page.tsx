@@ -7,15 +7,20 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { Users2, Swords, Shield, RefreshCcw, Link as LinkIcon, Sparkles, Trash2 } from 'lucide-react'
 
-let supabase: any = null
-try {
-  const { createClient } = require('@supabase/supabase-js')
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL
-  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
-  if (url && key) {
-    supabase = createClient(url, key)
+import type { SupabaseClient } from '@supabase/supabase-js';
+
+let supabase: SupabaseClient | null = null;
+// dynamic import keeps bundle lean and avoids ESM/require lint
+(async () => {
+  try {
+    const { createClient } = await import('@supabase/supabase-js');
+    const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+    if (url && key) supabase = createClient(url, key);
+  } catch {
+    // ignore: realtime is optional
   }
-} catch {}
+})();
 
 type MatchupScore = { my_hero: string; enemy_hero: string; score: number }
 type Assignment = Record<string, { hero: string; score: number } | null>
@@ -207,9 +212,12 @@ function useRealtime(room: string, state: DraftState, setState: (fn: (s: DraftSt
   useEffect(() => {
     if (!supabase) return
     const channel = supabase.channel(`draft:${room}`)
-    channel.on('broadcast', { event: 'state' }, (payload: any) => {
-      if (payload?.payload?.state) setState(() => payload.payload.state as DraftState)
-    })
+    type StatePayload = { payload?: { state?: DraftState } };
+    channel.on('broadcast', { event: 'state' }, (payload: StatePayload) => {
+      const next = payload?.payload?.state;
+      if (next) setState(() => next);
+    });
+
     channel.subscribe()
     return () => {
       supabase?.removeChannel?.(channel)
@@ -234,8 +242,8 @@ export default function DraftPage() {
 
   const suggestions = useMemo(() => {
     const enemyTeam = state.teamB.filter(Boolean);
-    return greedySuggest(rows, enemyTeam, state.k, lanes);
-  }, [rows, state.teamA, state.teamB, state.k, lanes]);
+    return greedySuggest(rows, enemyTeam, state.k);
+  }, [rows, state.teamB, state.k]);
 
   const winEst = useMemo(() => {
     return computeWinAgainst(rows, state.teamA, state.teamB);
@@ -280,11 +288,12 @@ export default function DraftPage() {
 
   useEffect(() => {
     loadDefaultCounters();
-    loadLanesCsv();               // ← add this
     const url = new URL(window.location.href);
     const r = url.searchParams.get('room');
     if (r && r !== state.room) setState(s => ({ ...s, room: r }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
 
 
   function applyRoom() {
